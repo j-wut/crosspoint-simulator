@@ -5,6 +5,8 @@
 #include <thread>
 
 #define pdTRUE 1
+#define pdPASS 1
+#define pdFAIL 0
 #define pdFALSE 0
 #define portMAX_DELAY 0xFFFFFFFF
 #define eIncrement 1
@@ -51,5 +53,8 @@ struct SimTaskHandle {
   uint32_t notifyCount = 0;
   std::thread::id id;
   const char *name = "sim-task";
+  // The mutex this task is blocked on, for deadlock reports. Guarded by the
+  // lock state mutex in semphr.cpp.
+  void *waitingOn = nullptr;
 };
 typedef SimTaskHandle *TaskHandle_t;

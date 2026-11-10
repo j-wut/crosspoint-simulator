@@ -17,6 +17,7 @@ for variant in normal ndebug; do
   "$build_dir/$variant"
   "$build_dir/$variant" held
   c++ -std=c++20 -Wall -Wextra -pthread $variant_flag -Isrc \
-    tests/static-mutex.cpp -o "$build_dir/mutex-$variant"
+    tests/static-mutex.cpp src/freertos/semphr.cpp src/SimLog.cpp \
+    -o "$build_dir/mutex-$variant"
   "$build_dir/mutex-$variant"
 done

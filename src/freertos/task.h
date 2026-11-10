@@ -17,8 +17,25 @@ inline SimTaskHandle *simMainTaskHandle() {
   return &mainTask;
 }
 
+// Set during static initialization, which runs on the process's first thread.
+inline const std::thread::id simProcessMainThread = std::this_thread::get_id();
+
+// Threads not made by xTaskCreate. The process's first thread is "main"; any
+// other host thread gets a handle of its own, so a lock it holds is never
+// mistaken for one held by main.
+inline SimTaskHandle *simHostThreadHandle() {
+  if (std::this_thread::get_id() == simProcessMainThread)
+    return simMainTaskHandle();
+  thread_local SimTaskHandle hostThread;
+  if (hostThread.id == std::thread::id()) {
+    hostThread.name = "host-thread";
+    hostThread.id = std::this_thread::get_id();
+  }
+  return &hostThread;
+}
+
 inline TaskHandle_t xTaskGetCurrentTaskHandle() {
-  return tl_currentTaskHandle ? tl_currentTaskHandle : simMainTaskHandle();
+  return tl_currentTaskHandle ? tl_currentTaskHandle : simHostThreadHandle();
 }
 
 // Create a real OS thread. The FreeRTOS task function signature is

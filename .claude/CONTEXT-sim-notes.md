@@ -71,7 +71,7 @@ pio run -e simulator -t run_simulator
 
 **Input.** [HalGPIO::update](src/HalGPIO.cpp) owns the SDL event pump (so polling isn't split between callers). It maps SDL scancodes → button indices (`BTN_BACK=0` … `BTN_POWER=6`) and maintains per-frame pressed/released arrays. On X4 Pro, SDL mouse input is transformed from the oriented logical window back into normalized physical touch coordinates, and `H` emulates the capacitive Home key. `SDL_QUIT` sets the shared `quitRequested` atomic that `HalDisplay::shouldQuit()` reads.
 
-**Threading.** [src/freertos/](src/freertos/) maps `xTaskCreate` to `std::thread`, `ulTaskNotifyTake`/`xTaskNotify` to a condvar + counter, and `SemaphoreHandle_t` to `std::recursive_mutex`. `thread_local SimTaskHandle*` lets each task thread find its own handle for notifies.
+**Threading.** [src/freertos/](src/freertos/) maps `xTaskCreate` to `std::thread`, `ulTaskNotifyTake`/`xTaskNotify` to a condvar + counter, and semaphores to device-accurate FreeRTOS semantics in [semphr.cpp](src/freertos/semphr.cpp) (non-recursive mutex, recursive mutex, binary/counting semaphores, deadlock reports). `thread_local SimTaskHandle*` lets each task thread find its own handle for notifies.
 
 **Time.** [Arduino.h](src/Arduino.h) `millis()` and `micros()` use `std::chrono::steady_clock`, not `system_clock`, so wall-clock changes don't affect timing. (Was `system_clock` originally; switched for predictability across host systems.)
 
@@ -145,7 +145,7 @@ After any of the storage / cache fixes: `rm -rf ./fs_/.crosspoint/` to drop stal
 ## Known Remaining Work
 
 - SDL window size now follows orientation changes at present time; keep resize and `SDL_RenderSetLogicalSize` on the main-thread `presentIfNeeded()` path. The library build hook patches the common `GfxRenderer::setOrientation()` implementation so consuming repos notify `HalDisplay` without a manual source edit.
-- Thread safety relies on `std::recursive_mutex` in `RenderLock`; no broader audit.
+- `RenderLock` uses a non-recursive mutex, as on the device. Taking it twice on one task hangs the simulator with a `[SIM-FREERTOS] DEADLOCK` report instead of passing silently.
 - `HalPowerManager::startDeepSleep` should not trigger on `WakeupReason::Other` — verify if it ever does.
 - Each new HAL method added in upstream firmware will fail to link until a matching stub is added here. Most are one-line no-ops.
 

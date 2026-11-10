@@ -1,156 +1,76 @@
 #pragma once
-#include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <mutex>
 
 #include "FreeRTOS.h"
 #include "task.h"
 
-// FreeRTOS hands out mutexes and binary semaphores through the same
-// SemaphoreHandle_t. They are different objects with different rules, so the
-// handle carries a tag and the shared entry points below dispatch on it.
-enum class SimSemaphoreKind { Mutex, Binary };
+// Semaphores with the same rules as FreeRTOS on the device (ESP-IDF):
+//
+// - xSemaphoreCreateMutex is NOT recursive. A task that takes a mutex it
+//   already holds blocks until ticksToWait runs out; with portMAX_DELAY it
+//   blocks forever, as the device does.
+// - xSemaphoreCreateRecursiveMutex is recursive only through
+//   xSemaphoreTakeRecursive / xSemaphoreGiveRecursive.
+// - Giving a mutex held by another task fails configASSERT on the device and
+//   aborts here. Giving a mutex nobody holds returns pdFALSE.
+// - Binary and counting semaphores have no owner. Any task may give them, and a
+//   give to a full semaphore returns pdFALSE.
+// - A NULL handle fails configASSERT on the device and aborts here.
+//
+// A blocked take that can never finish (a task waiting for itself, or a cycle
+// of tasks waiting for each other) and a mutex wait longer than 5 s are logged
+// with backtraces of the waiting task and of where the holder took the mutex.
+// The log line starts with "[SIM-FREERTOS]", so input scripts can WAIT for it.
+// The state lives in semphr.cpp, behind one host mutex.
+
+enum class SimSemaphoreKind { Mutex, RecursiveMutex, Counting };
 
 struct SimSemaphoreBase {
-  const SimSemaphoreKind kind;
+  SimSemaphoreKind kind;
+  std::condition_variable cv;
   explicit SimSemaphoreBase(SimSemaphoreKind k) : kind(k) {}
 };
 
-// Use a real recursive mutex for the rendering semaphore.
 struct SimMutex : SimSemaphoreBase {
-  SimMutex() : SimSemaphoreBase(SimSemaphoreKind::Mutex) {}
-  std::recursive_mutex mtx;
-  // Track "holder" for xSemaphoreGetMutexHolder compatibility (not thread-safe,
-  // good enough for simulator)
+  explicit SimMutex(SimSemaphoreKind k = SimSemaphoreKind::Mutex)
+      : SimSemaphoreBase(k) {}
   TaskHandle_t holder = nullptr;
-  uint16_t holdCount = 0;
+  uint32_t depth = 0; // Recursive takes by the holder.
+  // Where the holder took the mutex, for deadlock reports.
+  static constexpr int kTraceDepth = 24;
+  void *takenAt[kTraceDepth] = {};
+  int takenAtFrames = 0;
 };
 
-// A real binary semaphore: one token, created empty. A take with no token
-// waits, and reports failure when ticksToWait runs out. A give may come from
-// any thread, including one that never took it.
-struct SimBinarySemaphore : SimSemaphoreBase {
-  SimBinarySemaphore() : SimSemaphoreBase(SimSemaphoreKind::Binary) {}
-  std::mutex mtx;
-  std::condition_variable cv;
-  bool available = false;
+struct SimCountingSemaphore : SimSemaphoreBase {
+  SimCountingSemaphore(uint32_t max, uint32_t initial)
+      : SimSemaphoreBase(SimSemaphoreKind::Counting), count(initial), max(max) {
+  }
+  uint32_t count;
+  const uint32_t max;
 };
 
 typedef SimSemaphoreBase *SemaphoreHandle_t;
 // The static API currently used by firmware is xSemaphoreCreateMutexStatic.
 using StaticSemaphore_t = SimMutex;
 
-namespace sim_semaphore_detail {
+SemaphoreHandle_t xSemaphoreCreateMutex();
+SemaphoreHandle_t xSemaphoreCreateRecursiveMutex();
+SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *storage);
+// Created empty, as on the device: the first take waits for a give.
+SemaphoreHandle_t xSemaphoreCreateBinary();
+SemaphoreHandle_t xSemaphoreCreateCounting(uint32_t maxCount,
+                                           uint32_t initialCount);
+void vSemaphoreDelete(SemaphoreHandle_t sem);
 
-// Single non-virtual base, so a tag-checked downcast is exact. Nothing frees a
-// handle in this shim (there is no vSemaphoreDelete), so no base-pointer delete
-// happens and the base needs no virtual destructor.
-inline SimMutex *asMutex(SemaphoreHandle_t sem) {
-  return static_cast<SimMutex *>(sem);
-}
-inline SimBinarySemaphore *asBinary(SemaphoreHandle_t sem) {
-  return static_cast<SimBinarySemaphore *>(sem);
-}
+BaseType_t xSemaphoreTake(SemaphoreHandle_t sem, uint32_t ticksToWait);
+BaseType_t xSemaphoreGive(SemaphoreHandle_t sem);
+BaseType_t xSemaphoreTakeRecursive(SemaphoreHandle_t sem, uint32_t ticksToWait);
+BaseType_t xSemaphoreGiveRecursive(SemaphoreHandle_t sem);
 
-// FreeRTOS timeouts are in ticks. portTICK_PERIOD_MS (FreeRTOS.h) is the one
-// tick-rate definition this shim has, so convert through it rather than
-// assuming a tick is a millisecond.
-inline std::chrono::milliseconds ticksToDuration(uint32_t ticks) {
-  return std::chrono::milliseconds(static_cast<int64_t>(ticks) *
-                                   portTICK_PERIOD_MS);
-}
-
-} // namespace sim_semaphore_detail
-
-inline SemaphoreHandle_t xSemaphoreCreateMutex() { return new SimMutex(); }
-
-inline SemaphoreHandle_t
-xSemaphoreCreateMutexStatic(StaticSemaphore_t *storage) {
-  return storage;
-}
-
-inline SemaphoreHandle_t xSemaphoreCreateBinary() {
-  return new SimBinarySemaphore();
-}
-
-// Returns pdTRUE (true) on success, pdFALSE (false) when ticksToWait expired.
-// Only the binary semaphore can fail: a mutex take waits as long as it must,
-// which is what every caller of the recursive mutex already assumes.
-inline bool xSemaphoreTake(SemaphoreHandle_t sem, uint32_t ticksToWait) {
-  if (!sem)
-    return true;
-  if (sem->kind == SimSemaphoreKind::Binary) {
-    auto *bin = sim_semaphore_detail::asBinary(sem);
-    std::unique_lock<std::mutex> lk(bin->mtx);
-    const auto hasToken = [bin] { return bin->available; };
-    if (ticksToWait == portMAX_DELAY) {
-      bin->cv.wait(lk, hasToken);
-    } else if (!bin->cv.wait_for(
-                   lk, sim_semaphore_detail::ticksToDuration(ticksToWait),
-                   hasToken)) {
-      // ticksToWait == 0 lands here too: wait_for tests the predicate once and
-      // returns, which is the non-blocking "drain a stale give" poll.
-      return false;
-    }
-    bin->available = false;
-    return true;
-  }
-  auto *mtx = sim_semaphore_detail::asMutex(sem);
-  mtx->mtx.lock();
-  mtx->holder = xTaskGetCurrentTaskHandle();
-  mtx->holdCount++;
-  return true;
-}
-
-inline bool xSemaphoreGive(SemaphoreHandle_t sem) {
-  if (!sem)
-    return true;
-  if (sem->kind == SimSemaphoreKind::Binary) {
-    auto *bin = sim_semaphore_detail::asBinary(sem);
-    bool wasEmpty;
-    {
-      std::lock_guard<std::mutex> lk(bin->mtx);
-      wasEmpty = !bin->available;
-      bin->available = true;
-    }
-    // Notify outside the lock: the woken thread would only block on it again.
-    bin->cv.notify_one();
-    // FreeRTOS reports pdFALSE for a give that overflows a full semaphore.
-    return wasEmpty;
-  }
-  auto *mtx = sim_semaphore_detail::asMutex(sem);
-  if (mtx->holdCount > 0) {
-    mtx->holdCount--;
-  }
-  if (mtx->holdCount == 0) {
-    mtx->holder = nullptr;
-  }
-  mtx->mtx.unlock();
-  return true;
-}
-
-inline TaskHandle_t xSemaphoreGetMutexHolder(SemaphoreHandle_t sem) {
-  if (!sem || sem->kind != SimSemaphoreKind::Mutex)
-    return nullptr;
-  return sim_semaphore_detail::asMutex(sem)->holder;
-}
-
-// xQueuePeek on a mutex: returns pdTRUE if the mutex is available (not taken).
-// On a binary semaphore, "available" means a token is waiting to be taken.
-inline int xQueuePeek(SemaphoreHandle_t sem, void *, uint32_t) {
-  if (!sem)
-    return pdTRUE;
-  if (sem->kind == SimSemaphoreKind::Binary) {
-    auto *bin = sim_semaphore_detail::asBinary(sem);
-    std::lock_guard<std::mutex> lk(bin->mtx);
-    return bin->available ? pdTRUE : pdFALSE;
-  }
-  auto *mtx = sim_semaphore_detail::asMutex(sem);
-  bool locked = mtx->mtx.try_lock();
-  if (locked) {
-    mtx->mtx.unlock();
-    return pdTRUE;
-  }
-  return pdFALSE;
-}
+TaskHandle_t xSemaphoreGetMutexHolder(SemaphoreHandle_t sem);
+// Mutex: 1 when free, 0 when held. Counting/binary: tokens available.
+uint32_t uxSemaphoreGetCount(SemaphoreHandle_t sem);
+// On a semaphore handle: pdTRUE when a take would succeed now.
+int xQueuePeek(SemaphoreHandle_t sem, void *buffer, uint32_t ticksToWait);
